@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { readdir, writeFile, access } from 'fs/promises';
+import { readdir, writeFile, access, stat } from 'fs/promises';
 import { join, extname, basename } from 'path';
 import inquirer from 'inquirer';
 import { config } from 'dotenv';
@@ -31,11 +31,51 @@ async function findMp3Files(directory: string): Promise<string[]> {
     console.error(`Error reading directory ${directory}:`, error);
     return [];
   }
+}
+
+async function getFileSize(filePath: string): Promise<number> {
+  try {
+    const stats = await stat(filePath);
+    return stats.size;
+  } catch (error) {
+    console.error(`Error getting file size for ${filePath}:`, error);
+    return 0;
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${mb.toFixed(2)} MB`;
+}
+
+async function checkFileSizeLimit(filePath: string): Promise<boolean> {
+  const fileSize = await getFileSize(filePath);
+  const maxSize = 25 * 1024 * 1024; // 25MB in bytes
+  
+  if (fileSize > maxSize) {
+    console.log(`\n⚠️  Warning: ${basename(filePath)} is ${formatFileSize(fileSize)}, which exceeds OpenAI's 25MB limit.`);
+    console.log(`\n💡 To process this file, you can:`);
+    console.log(`   1. Use audio compression software to reduce file size`);
+    console.log(`   2. Split the file into smaller chunks using tools like:`);
+    console.log(`      • FFmpeg: ffmpeg -i input.mp3 -f segment -segment_time 600 -c copy output_%03d.mp3`);
+    console.log(`      • Audacity (GUI): File > Export > Multiple...`);
+    console.log(`      • Online tools like MP3Cut or AudioTrimmer`);
+    console.log(`\n   Then place the smaller files in your input directory and run this tool again.\n`);
+    return false;
+  }
+  
+  return true;
 } 
 
 async function transcribeAudio(audioPath: string, model: string, prompt?: string): Promise<string> {
   try {
-    console.log(`🎵 Transcribing: ${basename(audioPath)}`);
+
+    const isValidSize = await checkFileSizeLimit(audioPath);
+    if (!isValidSize) {
+      throw new Error(`File ${basename(audioPath)} exceeds 25MB limit`);
+    }
+
+    console.log(`🎵 Transcribing: ${basename(audioPath)} (${formatFileSize(await getFileSize(audioPath))})`);
     
     const transcriptionParams: any = {
       file: Bun.file(audioPath),
@@ -70,7 +110,7 @@ async function saveTranscription(text: string, originalFileName: string, outputP
 async function getCliConfig(): Promise<TranscriptionConfig> {
   console.log('🎙️  Welcome to Whisper Transcript CLI\n');
 
-  // First ask if single or multiple files
+
   const modeChoice = await inquirer.prompt({
     type: 'list',
     name: 'mode',
@@ -85,7 +125,7 @@ async function getCliConfig(): Promise<TranscriptionConfig> {
   let selectedFiles: string[] = [];
 
   if (modeChoice.mode === 'single') {
-    // Single file mode
+
     const singleFileConfig = await inquirer.prompt([
       {
         type: 'input',
@@ -122,7 +162,6 @@ async function getCliConfig(): Promise<TranscriptionConfig> {
     config = { ...config, ...singleFileConfig };
     selectedFiles = [singleFileConfig.filePath];
   } else {
-    // Multiple files mode
     const multipleFilesConfig = await inquirer.prompt([
       {
         type: 'input',
@@ -156,7 +195,6 @@ async function getCliConfig(): Promise<TranscriptionConfig> {
 
     config = { ...config, ...multipleFilesConfig };
 
-    // Find MP3 files in the input directory
     const mp3Files = await findMp3Files(config.inputPath);
     
     if (mp3Files.length === 0) {
@@ -164,12 +202,18 @@ async function getCliConfig(): Promise<TranscriptionConfig> {
       process.exit(1);
     }
 
-    // Let user select which files to process
-    const fileChoices = mp3Files.map(file => ({
-      name: basename(file),
-      value: file,
-      checked: true
-    }));
+    const fileChoices = await Promise.all(
+      mp3Files.map(async file => {
+        const size = await getFileSize(file);
+        const sizeStr = formatFileSize(size);
+        const isOverLimit = size > 25 * 1024 * 1024;
+        return {
+          name: `${basename(file)} (${sizeStr})${isOverLimit ? ' ⚠️  TOO LARGE' : ''}`,
+          value: file,
+          checked: !isOverLimit
+        };
+      })
+    );
 
     const fileSelection = await inquirer.prompt({
       type: 'checkbox',
@@ -187,8 +231,7 @@ async function getCliConfig(): Promise<TranscriptionConfig> {
     selectedFiles = fileSelection.selectedFiles;
   }
 
-  // Common configuration for both modes
-  const commonConfig = await inquirer.prompt([
+      const commonConfig = await inquirer.prompt([
     {
       type: 'list',
       name: 'model',
